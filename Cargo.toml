@@ -1,0 +1,13 @@
+[package]
+name = "futures-engine"
+version = "0.1.0"
+edition = "2026"
+description = "Deterministic crypto perpetual-futures matching engine with margin, leverage and liquidation"
+license = "MIT"
+repository = "https://github.com/tsoxatzopoulos/matching-engine-perpetual-futures"
+
+[dependencies]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
