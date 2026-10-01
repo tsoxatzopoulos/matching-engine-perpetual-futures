@@ -5,13 +5,15 @@
 //! command sequence the engine always produces the same events, so a command
 //! journal is enough to rebuild state or run a hot standby.
 
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 
 use crate::account::{margin_summary, Account, MarginSummary, Position};
 use crate::events::{BalanceReason, DoneReason, Event, RejectReason};
+use crate::hash::{FastMap, FastSet};
 use crate::fixed::{mul_div, notional, Amount, Price, Qty, Rate, Round, SCALE};
 use crate::market::{Market, SymbolSpec};
 use crate::order::{trailing_stop_price, NewOrder, Order, TpSl, TrailingState, TriggerState};
+use crate::risk::{compute_bands, AdlRanking, Armed};
 use crate::types::*;
 
 /// Upper bound on trigger/liquidation cascade steps per command.
@@ -51,6 +53,15 @@ pub struct Depth {
     pub asks: Vec<(Price, Qty)>,
 }
 
+/// State of a running liquidation pass (`check_liquidations`).
+struct LiqPass {
+    symbol: SymbolId,
+    /// Accounts touched by a fill during the pass.
+    seen: FastSet<AccountId>,
+    /// First touches: (account, was a holder of `symbol` when the pass started).
+    touched: Vec<(AccountId, bool)>,
+}
+
 /// How a taker's matching loop ended.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MatchEnd {
@@ -61,7 +72,7 @@ enum MatchEnd {
 
 pub struct Engine {
     markets: Vec<Market>,
-    accounts: HashMap<AccountId, Account>,
+    accounts: FastMap<AccountId, Account>,
     insurance_fund: Amount,
     next_order_id: OrderId,
     next_trade_id: u64,
@@ -70,6 +81,14 @@ pub struct Engine {
     dirty: Vec<SymbolId>,
     /// Positions that changed and need reduce-only order maintenance.
     touched: Vec<(AccountId, SymbolId)>,
+    /// Spare buffer swapped with `touched` in `settle()` to keep its capacity.
+    touched_spare: Vec<(AccountId, SymbolId)>,
+    /// Accounts whose risk bands are stale (see `risk`).
+    risk_dirty: Vec<AccountId>,
+    liq_pass: Option<LiqPass>,
+    /// Per-symbol ADL ranking, built lazily during a liquidation pass.
+    adl_rankings: Vec<Option<AdlRanking>>,
+    armed_buf: Armed,
 }
 
 impl Default for Engine {
@@ -86,6 +105,12 @@ fn crosses(taker_side: Side, limit: Price, opposite_best: Price) -> bool {
     }
 }
 
+#[cold]
+#[inline(never)]
+fn update_ranking(ranking: &mut AdlRanking, account: AccountId, pos: &Position, mark: Price) {
+    ranking.update(account, pos, mark);
+}
+
 /// Price at which a position's equity reaches zero:
 /// `margin + (P - entry) * size = 0`, rounded to a tick toward the entry.
 fn bankruptcy_price(entry: Price, size: Qty, margin: Amount, tick: Price) -> Price {
@@ -99,13 +124,18 @@ impl Engine {
     pub fn new() -> Self {
         Self {
             markets: Vec::new(),
-            accounts: HashMap::new(),
+            accounts: FastMap::default(),
             insurance_fund: Amount::ZERO,
             next_order_id: 1,
             next_trade_id: 1,
             events: Vec::new(),
             dirty: Vec::new(),
             touched: Vec::new(),
+            touched_spare: Vec::new(),
+            risk_dirty: Vec::new(),
+            liq_pass: None,
+            adl_rankings: Vec::new(),
+            armed_buf: Armed::default(),
         }
     }
 
@@ -133,12 +163,13 @@ impl Engine {
         self.accounts.get(&account).map(|a| margin_summary(a, &self.markets))
     }
 
-    pub fn order(&self, symbol: SymbolId, id: OrderId) -> Option<&Order> {
+    /// Copy of a live order (resting or conditional).
+    pub fn order(&self, symbol: SymbolId, id: OrderId) -> Option<Order> {
         let m = self.market(symbol)?;
-        m.book.get(id).or_else(|| m.cond.get(id))
+        m.book.order(id).or_else(|| m.cond.get(id).cloned())
     }
 
-    pub fn open_orders(&self, account: AccountId, symbol: SymbolId) -> Vec<&Order> {
+    pub fn open_orders(&self, account: AccountId, symbol: SymbolId) -> Vec<Order> {
         let Some(pos) = self.position(account, symbol) else { return Vec::new() };
         pos.order_ids.iter().filter_map(|&id| self.order(symbol, id)).collect()
     }
@@ -187,8 +218,25 @@ impl Engine {
     // Command entry points
     // ------------------------------------------------------------------
 
-    /// Applies one command and returns the events it produced.
+    /// Applies one command and returns the events it produced, as an owned
+    /// `Vec` (one allocation per command). See [`Engine::apply`] for the
+    /// allocation-free variant.
     pub fn process(&mut self, cmd: Command) -> Vec<Event> {
+        self.dispatch(cmd);
+        self.take_events()
+    }
+
+    /// Applies one command and returns its events as a slice of an internal
+    /// buffer that is reused for every command, so no allocation happens once
+    /// the buffer has grown. Events of earlier direct method calls that were
+    /// not taken are discarded first.
+    pub fn apply(&mut self, cmd: Command) -> &[Event] {
+        self.events.clear();
+        self.dispatch(cmd);
+        &self.events
+    }
+
+    fn dispatch(&mut self, cmd: Command) {
         let _ = match cmd {
             Command::AddMarket { spec, price } => {
                 self.add_market(spec, price);
@@ -215,7 +263,6 @@ impl Engine {
             Command::MarkPrice { symbol, mark, index } => self.update_mark_price(symbol, mark, index),
             Command::Funding { symbol, rate } => self.apply_funding(symbol, rate),
         };
-        self.take_events()
     }
 
     /// Emits `CommandRejected` on error and settles cascades.
@@ -231,6 +278,7 @@ impl Engine {
         let id = self.markets.len() as SymbolId;
         spec.id = id;
         self.markets.push(Market::new(spec, price));
+        self.adl_rankings.push(None);
         self.events.push(Event::MarketAdded { symbol: id });
         id
     }
@@ -240,6 +288,7 @@ impl Engine {
             let a = self.accounts.entry(account).or_insert_with(|| Account::new(account));
             a.balance += amount;
             let balance = a.balance;
+            self.touch_risk(account);
             self.events.push(Event::BalanceChanged { account, balance, delta: amount, reason: BalanceReason::Deposit });
             Ok(())
         } else {
@@ -265,6 +314,7 @@ impl Engine {
         let a = self.accounts.get_mut(&account).expect("account");
         a.balance -= amount;
         let balance = a.balance;
+        self.touch_risk(account);
         self.events.push(Event::BalanceChanged { account, balance, delta: -amount, reason: BalanceReason::Withdraw });
         Ok(())
     }
@@ -660,11 +710,8 @@ impl Engine {
             if !crosses(taker.side, taker.price, best) {
                 break;
             }
-            let maker_id = book.front(opp, best).expect("non-empty level");
-            let (maker_account, maker_visible, maker_ro) = {
-                let mo = book.get(maker_id).expect("maker");
-                (mo.account, mo.visible, mo.reduce_only)
-            };
+            let mo = book.front(opp, best).expect("non-empty level");
+            let (maker_id, maker_account, maker_visible, maker_ro) = (mo.id, mo.account, mo.visible, mo.reduce_only());
 
             if maker_account == taker.account && !taker.is_liquidation {
                 match taker.stp {
@@ -706,14 +753,14 @@ impl Engine {
         let symbol = taker.symbol;
         let si = symbol as usize;
         let n = notional(price, qty);
-        let maker_account = self.markets[si].book.get(maker_id).expect("maker").account;
+        let maker_account = self.markets[si].book.resting(maker_id).expect("maker").account;
         let maker_fee = n.mul_rate(self.fee_rate(maker_account, symbol, true), Round::Up);
         let taker_fee = n.mul_rate(self.fee_rate(taker.account, symbol, false), Round::Up);
 
         let m = &mut self.markets[si];
         let mo = m.book.fill(maker_id, qty, n);
         let (maker_side, maker_ro, maker_leaves, maker_visible, maker_attached) =
-            (mo.side, mo.reduce_only, mo.leaves(), mo.visible, mo.has_attachments());
+            (mo.side, mo.reduce_only(), mo.leaves(), mo.visible, mo.has_attachments());
         m.last_price = price;
         taker.filled += qty;
         taker.cum_quote += n;
@@ -746,10 +793,10 @@ impl Engine {
             self.attach_on_fill(taker.account, symbol, taker.side, taker.id, tp, sl, &mut taker.children, qty);
         }
         if maker_attached {
-            let mo = self.markets[si].book.get(maker_id).expect("maker");
+            let mo = self.markets[si].book.meta(maker_id).expect("maker");
             let (tp, sl, mut children) = (mo.take_profit, mo.stop_loss, mo.children);
             self.attach_on_fill(maker_account, symbol, maker_side, maker_id, tp, sl, &mut children, qty);
-            self.markets[si].book.get_mut(maker_id).expect("maker").children = children;
+            self.markets[si].book.meta_mut(maker_id).expect("maker").children = children;
         }
 
         if maker_leaves.is_zero() {
@@ -762,15 +809,20 @@ impl Engine {
             if maker_visible.is_zero() {
                 book.replenish(maker_id);
             }
-            book.get_mut(maker_id).expect("maker").status = OrderStatus::PartiallyFilled;
+            book.meta_mut(maker_id).expect("maker").status = OrderStatus::PartiallyFilled;
         }
         self.mark_dirty(symbol);
     }
 
     /// Books a fill into the account's position and balances.
     fn apply_fill(&mut self, account: AccountId, symbol: SymbolId, side: Side, price: Price, qty: Qty, fee: Amount) {
+        if self.liq_pass.is_some() {
+            self.note_pass_touch(account);
+        }
         let default_lev = self.markets[symbol as usize].spec.default_leverage;
         let a = self.accounts.get_mut(&account).expect("account");
+        let newly_dirty = !a.risk_dirty;
+        a.risk_dirty = true;
         let pos = a.positions.entry(symbol).or_insert_with(|| Position::new(default_lev));
         let old = pos.size;
         let isolated = pos.margin_mode == MarginMode::Isolated;
@@ -832,6 +884,9 @@ impl Engine {
             }
         }
         let (size, entry_price) = (pos.size, pos.entry_price);
+        if let Some(ranking) = self.adl_rankings[symbol as usize].as_mut() {
+            update_ranking(ranking, account, pos, self.markets[symbol as usize].mark_price);
+        }
 
         let holders = &mut self.markets[symbol as usize].holders;
         if size.is_zero() {
@@ -841,6 +896,9 @@ impl Engine {
         }
         if deficit.is_pos() {
             self.change_insurance(-deficit);
+        }
+        if newly_dirty {
+            self.risk_dirty.push(account);
         }
         self.events.push(Event::PositionChanged { account, symbol, size, entry_price, realized_pnl: realized, fee });
         self.touched.push((account, symbol));
@@ -1003,7 +1061,7 @@ impl Engine {
             return Err(LotSize);
         }
 
-        if let Some(o) = m.book.get(id) {
+        if let Some(o) = m.book.order(id) {
             if o.account != account {
                 return Err(UnknownOrder);
             }
@@ -1161,6 +1219,7 @@ impl Engine {
         }
         if top_up.is_pos() {
             self.accounts.get_mut(&account).expect("account").balance -= top_up;
+            self.touch_risk(account);
             let pos = self.pos_mut(account, symbol);
             pos.isolated_margin += top_up;
             let isolated_margin = pos.isolated_margin;
@@ -1224,6 +1283,7 @@ impl Engine {
             }
         }
         self.accounts.get_mut(&account).expect("account").balance -= delta;
+        self.touch_risk(account);
         let pos = self.pos_mut(account, symbol);
         pos.isolated_margin += delta;
         let isolated_margin = pos.isolated_margin;
@@ -1346,11 +1406,24 @@ impl Engine {
                     let a = self.accounts.get_mut(&account).expect("account");
                     let pos = a.positions.get_mut(&symbol).expect("position");
                     let amount = notional(mark, pos.size).mul_rate(rate, Round::Down);
-                    match pos.margin_mode {
-                        MarginMode::Isolated => pos.isolated_margin -= amount,
-                        MarginMode::Cross => a.balance -= amount,
-                    }
+                    // Debits come out of the risk headroom; the bands stay valid
+                    // until it runs out (see docs/liquidation-index.md).
+                    let headroom = match pos.margin_mode {
+                        MarginMode::Isolated => {
+                            pos.isolated_margin -= amount;
+                            pos.risk_headroom -= amount;
+                            pos.risk_headroom
+                        }
+                        MarginMode::Cross => {
+                            a.balance -= amount;
+                            a.risk_headroom -= amount;
+                            a.risk_headroom
+                        }
+                    };
                     pos.funding_paid += amount;
+                    if headroom.is_neg() {
+                        self.touch_risk(account);
+                    }
                     self.events.push(Event::FundingPayment { account, symbol, rate, amount });
                 }
                 self.check_liquidations(symbol);
@@ -1378,12 +1451,15 @@ impl Engine {
                 continue;
             }
             if !self.touched.is_empty() {
-                let mut touched = std::mem::take(&mut self.touched);
+                let spare = std::mem::take(&mut self.touched_spare);
+                let mut touched = std::mem::replace(&mut self.touched, spare);
                 touched.sort_unstable();
                 touched.dedup();
-                for (account, symbol) in touched {
+                for &(account, symbol) in &touched {
                     self.sync_reduce_only(account, symbol);
                 }
+                touched.clear();
+                self.touched_spare = touched;
                 continue;
             }
             return;
@@ -1437,7 +1513,7 @@ impl Engine {
         let m = &self.markets[symbol as usize];
         let mut cancel = Vec::new();
         for &id in &pos.reduce_only_ids {
-            if let Some(o) = m.book.get(id) {
+            if let Some(o) = m.book.resting(id) {
                 if Some(o.side) != closing_side || o.leaves() > budget {
                     cancel.push(id);
                 } else {
@@ -1457,26 +1533,143 @@ impl Engine {
     // Liquidation and auto-deleveraging
     // ------------------------------------------------------------------
 
+    /// Marks an account's risk bands stale, and records the first touch of
+    /// an account during a liquidation pass.
+    fn touch_risk(&mut self, account: AccountId) {
+        if self.liq_pass.is_some() {
+            self.note_pass_touch(account);
+        }
+        self.mark_risk_dirty(account);
+    }
+
+    fn mark_risk_dirty(&mut self, account: AccountId) {
+        if let Some(a) = self.accounts.get_mut(&account)
+            && !a.risk_dirty
+        {
+            a.risk_dirty = true;
+            self.risk_dirty.push(account);
+        }
+    }
+
+    /// During a liquidation pass, records the first touch of an account
+    /// together with whether it held the pass symbol when the pass started.
+    #[cold]
+    #[inline(never)]
+    fn note_pass_touch(&mut self, account: AccountId) {
+        if let Some(pass) = self.liq_pass.as_mut()
+            && pass.seen.insert(account)
+        {
+            let was_holder = self.markets[pass.symbol as usize].holders.contains(&account);
+            pass.touched.push((account, was_holder));
+        }
+    }
+
+    /// Liquidates holders of `symbol` that are below maintenance margin.
+    ///
+    /// Equivalent to visiting every holder in `AccountId` order (the reference
+    /// behaviour), but only candidates from the risk index, dirty accounts and
+    /// accounts touched during the pass are visited. See `docs/liquidation-index.md`.
     fn check_liquidations(&mut self, symbol: SymbolId) {
-        let holders: Vec<AccountId> = self.markets[symbol as usize].holders.iter().copied().collect();
-        for account in holders {
-            let Some(pos) = self.position(account, symbol) else { continue };
-            if pos.size.is_zero() {
-                continue;
-            }
-            match pos.margin_mode {
-                MarginMode::Isolated => {
-                    if self.isolated_at_risk(account, symbol) {
-                        self.liquidate_isolated(account, symbol);
+        let si = symbol as usize;
+        let mut pending = BTreeSet::new();
+        {
+            let m = &self.markets[si];
+            m.risk.collect(m.mark_price, &mut pending);
+            pending.extend(self.risk_dirty.iter().copied());
+            pending.retain(|a| m.holders.contains(a));
+        }
+        self.liq_pass = Some(LiqPass { symbol, seen: FastSet::default(), touched: Vec::new() });
+
+        while let Some(account) = pending.pop_first() {
+            // Re-arm afterwards: its band was breached or its state is stale.
+            self.touch_risk(account);
+            if let Some(pos) = self.position(account, symbol).filter(|p| !p.size.is_zero()) {
+                match pos.margin_mode {
+                    MarginMode::Isolated => {
+                        if self.isolated_at_risk(account, symbol) {
+                            self.liquidate_isolated(account, symbol);
+                        }
+                    }
+                    MarginMode::Cross => {
+                        if self.cross_at_risk(account) {
+                            self.liquidate_cross(account);
+                        }
                     }
                 }
-                MarginMode::Cross => {
-                    if self.cross_at_risk(account) {
-                        self.liquidate_cross(account);
-                    }
+                self.settle();
+            }
+            // Holders still ahead of the cursor whose state just changed.
+            let pass = self.liq_pass.as_mut().expect("liquidation pass");
+            for (x, was_holder) in pass.touched.drain(..) {
+                if was_holder && x > account {
+                    pending.insert(x);
                 }
             }
-            self.settle();
+        }
+
+        self.liq_pass = None;
+        for ranking in &mut self.adl_rankings {
+            *ranking = None;
+        }
+        self.rearm_dirty();
+        #[cfg(any(debug_assertions, feature = "risk-oracle"))]
+        self.verify_risk_index();
+    }
+
+    /// Recomputes the risk bands of every dirty account at the current marks.
+    fn rearm_dirty(&mut self) {
+        let mut dirty = std::mem::take(&mut self.risk_dirty);
+        let mut armed = std::mem::take(&mut self.armed_buf);
+        for &account in &dirty {
+            let Some(acct) = self.accounts.get_mut(&account) else { continue };
+            acct.risk_dirty = false;
+            for (&sym, pos) in acct.positions.iter_mut() {
+                if let Some(band) = pos.risk_band.take() {
+                    self.markets[sym as usize].risk.remove(account, band);
+                }
+            }
+            compute_bands(acct, &self.markets, &mut armed);
+            acct.risk_headroom = armed.cross_headroom;
+            for &(sym, band, headroom) in &armed.bands {
+                let pos = acct.positions.get_mut(&sym).expect("position");
+                pos.risk_band = Some(band);
+                pos.risk_headroom = headroom;
+                self.markets[sym as usize].risk.insert(account, band);
+            }
+        }
+        dirty.clear();
+        self.risk_dirty = dirty;
+        self.armed_buf = armed;
+    }
+
+    /// Reference oracle: full scan asserting the index missed no account.
+    #[cfg(any(debug_assertions, feature = "risk-oracle"))]
+    fn verify_risk_index(&self) {
+        use crate::risk::ALWAYS;
+        assert!(self.risk_dirty.is_empty(), "dirty accounts left after a liquidation pass");
+        for (&account, acct) in &self.accounts {
+            let cross_risk = self.cross_at_risk(account);
+            for (&sym, pos) in &acct.positions {
+                if pos.size.is_zero() {
+                    assert!(pos.risk_band.is_none(), "flat position {account}/{sym} still indexed");
+                    continue;
+                }
+                let m = &self.markets[sym as usize];
+                let band = pos.risk_band.unwrap_or_else(|| panic!("position {account}/{sym} not indexed"));
+                assert!(m.risk.contains(account, band), "band of {account}/{sym} missing from the index");
+                let at_risk = match pos.margin_mode {
+                    MarginMode::Isolated => self.isolated_at_risk(account, sym),
+                    MarginMode::Cross => cross_risk,
+                };
+                if at_risk {
+                    assert_eq!(band, ALWAYS, "risk index missed account {account} in symbol {sym}");
+                } else if band != ALWAYS {
+                    assert!(
+                        band.0 <= m.mark_price && m.mark_price <= band.1,
+                        "mark of {sym} outside the band of {account} without a check"
+                    );
+                }
+            }
         }
     }
 
@@ -1552,6 +1745,7 @@ impl Engine {
         if flat && acct.balance.is_neg() {
             let deficit = -acct.balance;
             acct.balance = Amount::ZERO;
+            self.touch_risk(account);
             self.change_insurance(-deficit);
         }
     }
@@ -1559,6 +1753,7 @@ impl Engine {
     fn charge_clearance(&mut self, account: AccountId, fee: Amount) {
         if fee.is_pos() {
             self.accounts.get_mut(&account).expect("account").balance -= fee;
+            self.touch_risk(account);
             self.change_insurance(fee);
         }
     }
@@ -1597,28 +1792,33 @@ impl Engine {
     /// Closes `qty` of the liquidated position against the most profitable,
     /// most leveraged opposite positions at the bankruptcy price.
     fn auto_deleverage(&mut self, liquidated: AccountId, symbol: SymbolId, side: Side, qty: Qty, price: Price) {
-        let m = &self.markets[symbol as usize];
-        let mark = m.mark_price;
-        let mut ranked: Vec<(i128, AccountId, Qty)> = m
-            .holders
-            .iter()
-            .filter(|&&a| a != liquidated)
-            .filter_map(|&a| {
-                let p = self.position(a, symbol)?;
-                // Counterparties hold the opposite side, i.e. they trade `side.opposite()`
-                // to close, which means their size has the sign of `side`.
-                (p.size.signum() == side.sign()).then(|| {
-                    let ratio = p.pnl_ratio(mark).0 as i128;
-                    let lev = p.leverage as i128;
-                    let score = if ratio > 0 { ratio * lev } else { ratio / lev };
-                    (score, a, p.size.abs())
-                })
-            })
-            .collect();
-        ranked.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+        debug_assert!(self.liq_pass.is_some(), "ADL outside a liquidation pass");
+        let si = symbol as usize;
+        if self.adl_rankings[si].is_none() {
+            let m = &self.markets[si];
+            let accounts = &self.accounts;
+            let positions = m.holders.iter().map(|&a| (a, &accounts[&a].positions[&symbol]));
+            self.adl_rankings[si] = Some(AdlRanking::build(positions, m.mark_price));
+        }
+        // Counterparties hold the opposite side, i.e. they trade `side.opposite()`
+        // to close, which means their size has the sign of `side`. Take the
+        // ranked prefix that covers `qty`, with sizes as of now.
+        let mut ranked: Vec<(AccountId, Qty)> = Vec::new();
+        let mut covered = Qty::ZERO;
+        for a in self.adl_rankings[si].as_ref().expect("ranking").iter(side.sign()) {
+            if covered >= qty {
+                break;
+            }
+            if a == liquidated {
+                continue;
+            }
+            let size = self.accounts[&a].positions[&symbol].size.abs();
+            covered += size;
+            ranked.push((a, size));
+        }
 
         let mut remaining = qty;
-        for (_, counterparty, size) in ranked {
+        for (counterparty, size) in ranked {
             if !remaining.is_pos() {
                 break;
             }

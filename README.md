@@ -148,13 +148,24 @@ NewOrder::trailing_stop(acct, sym, Side::Sell, TrailingOffset::Rate(Rate::parse(
 
 ### Running on its own thread
 
+The engine thread sits behind two lock-free SPSC ring buffers (`src/spsc.rs`):
+one for commands and one for events. Each event comes out tagged with the
+sequence number of its command, followed by `Output::Done`, so nothing is
+allocated per command. The engine thread busy-spins while idle.
+
 ```rust
-let handle = EngineHandle::spawn(Engine::new(), 65_536);
+let mut handle = EngineHandle::spawn(Engine::new(), 1 << 12, 1 << 16);
 handle.send(Command::AddMarket { spec, price }).unwrap();
 handle.send(Command::PlaceOrder(order)).unwrap();
 
-let (seq, events) = handle.events().recv().unwrap();
-let engine = handle.shutdown(); // drains the queue and returns the final state
+while let Some(out) = handle.recv() {
+    match out {
+        Output::Event { seq, event } => println!("#{seq}: {event:?}"),
+        Output::Done { seq } if seq == 2 => break,
+        Output::Done { .. } => {}
+    }
+}
+let engine = handle.shutdown(); // finishes queued commands and returns the final state
 ```
 
 ### Commands
@@ -247,7 +258,6 @@ On a single core of a laptop it reaches about **1.6M commands/s (~600 ns/command
 - [ ] Partial liquidation by risk tier
 - [ ] GTD orders (time-aware engine)
 - [ ] Mark-price and funding-rate calculation from index and premium
-- [ ] Lock-free SPSC ring buffer in place of the std channel
 
 ## Acknowledgements
 
@@ -264,3 +274,36 @@ These projects influenced the design:
 ## Disclaimer
 
 This is an educational project. It has not been audited and is not intended for production trading with real funds.
+
+
+  ┌───────────────────────┬──────────────────────┬───────────────────────────────┐
+  │         Θέμα          │       Binance        │             Εμείς             │
+  ├───────────────────────┼──────────────────────┼───────────────────────────────┤
+  │ Hedge mode (long και  │ ✅                   │ ❌ μόνο one-way               │
+  │ short ταυτόχρονα)     │                      │                               │
+  ├───────────────────────┼──────────────────────┼───────────────────────────────┤
+  │ Liquidation           │ Μερική, ανά tier     │ Πάντα όλη η θέση              │
+  ├───────────────────────┼──────────────────────┼───────────────────────────────┤
+  │ Υπόλοιπο margin σε    │ Πηγαίνει όλο στο     │ Παίρνει μόνο clearance fee,   │
+  │ isolated liquidation  │ insurance fund       │ το υπόλοιπο επιστρέφει στον   │
+  │                       │                      │ χρήστη                        │
+  ├───────────────────────┼──────────────────────┼───────────────────────────────┤
+  │ Mark price / funding  │ Τα υπολογίζει η ίδια │ Δίνονται απ' έξω              │
+  │ rate                  │  (index + premium)   │                               │
+  ├───────────────────────┼──────────────────────┼───────────────────────────────┤
+  ├────────────────────────┼─────────────────────┼──────────────────────────────┤
+  │ Trailing callback      │ Μόνο 0.1%–10%       │ Οποιοδήποτε ποσοστό ή        │
+  │                        │                     │ σταθερή απόσταση σε τιμή     │
+  ├────────────────────────┼─────────────────────┼──────────────────────────────┤
+  │ Iceberg                │ Δεν υπάρχει στα     │ ✅ υπάρχει                   │
+  │                        │ futures             │                              │
+  ├────────────────────────┼─────────────────────┼──────────────────────────────┤
+  │ GTD, priceMatch (BBO)  │ ✅                  │ ❌                           │
+  ├────────────────────────┼─────────────────────┼──────────────────────────────┤
+  │ Multi-Assets /         │ ✅                  │ ❌                           │
+  │ Portfolio Margin       │                     │                              │
+  ├────────────────────────┼─────────────────────┼──────────────────────────────┤
+  │ Inverse (COIN-M)       │ ✅                  │ ❌                           │
+  │ contracts              │                     │                              │
+  ├────────────────────────┼─────────────────────┼──────────────────────────────┤
+  │ REST/WebSocket API,    │ ✅                  │ ❌ υπάρχει μόνο η βιβλιοθήκη 

@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use crate::book::OrderBook;
 use crate::conditional::ConditionalBook;
 use crate::fixed::{Amount, Price, Qty, Rate, Round};
+use crate::risk::RiskBands;
 use crate::types::{AccountId, SymbolId, TriggerBy};
 
 /// One risk-limit bracket: positions up to `max_notional` may use at most
@@ -153,6 +154,8 @@ pub struct Market {
     pub index_price: Price,
     /// Accounts with a non-zero position (deterministic order).
     pub holders: BTreeSet<AccountId>,
+    /// Liquidation candidate index (see `risk`).
+    pub risk: RiskBands,
 }
 
 impl Market {
@@ -165,6 +168,7 @@ impl Market {
             mark_price: price,
             index_price: price,
             holders: BTreeSet::new(),
+            risk: RiskBands::default(),
         }
     }
 

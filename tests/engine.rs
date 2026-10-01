@@ -595,15 +595,40 @@ fn liquidation_cancels_orders_first() {
 
 #[test]
 fn engine_thread_round_trip() {
-    let h = EngineHandle::spawn(Engine::new(), 1024);
+    let mut h = EngineHandle::spawn(Engine::new(), 1024, 1 << 14);
     h.send(Command::AddMarket { spec: spec(), price: p("100") }).unwrap();
     h.send(Command::Deposit { account: 1, amount: a("1000") }).unwrap();
     h.send(Command::Deposit { account: 2, amount: a("1000") }).unwrap();
     h.send(Command::PlaceOrder(limit(1, Side::Sell, "100", "1"))).unwrap();
     h.send(Command::PlaceOrder(limit(2, Side::Buy, "100", "1"))).unwrap();
-    let batches: Vec<(u64, Vec<Event>)> = (0..5).map(|_| h.events().recv().unwrap()).collect();
-    assert_eq!(batches.iter().map(|b| b.0).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
-    assert_eq!(trades(&batches[4].1).len(), 1);
+
+    let mut done = Vec::new();
+    let mut last_events = Vec::new();
+    while done.len() < 5 {
+        match h.recv().expect("engine running") {
+            Output::Event { seq, event } => {
+                assert_eq!(seq, done.len() as u64 + 1, "events arrive in command order");
+                if seq == 5 {
+                    last_events.push(event);
+                }
+            }
+            Output::Done { seq } => done.push(seq),
+        }
+    }
+    assert_eq!(done, vec![1, 2, 3, 4, 5]);
+    assert_eq!(trades(&last_events).len(), 1);
     let engine = h.shutdown();
     assert_eq!(engine.position(2, S).unwrap().size, q("1"));
+}
+
+#[test]
+fn engine_thread_shutdown_drains_queued_commands() {
+    let mut h = EngineHandle::spawn(Engine::new(), 8, 8);
+    h.send(Command::AddMarket { spec: spec(), price: p("100") }).unwrap();
+    for account in 1..=200 {
+        // Far more events than the event ring holds: shutdown must keep draining.
+        h.send(Command::Deposit { account, amount: a("1000") }).unwrap();
+    }
+    let engine = h.shutdown();
+    assert_eq!(engine.account(200).unwrap().balance, a("1000"));
 }

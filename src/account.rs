@@ -85,6 +85,10 @@ pub struct Position {
     pub reduce_only_ids: BTreeSet<OrderId>,
     pub tp_order: Option<OrderId>,
     pub sl_order: Option<OrderId>,
+    /// Current liquidation-index band, if the position is indexed.
+    pub risk_band: Option<crate::risk::Band>,
+    /// Isolated only: buffer held back from the band for funding debits.
+    pub risk_headroom: Amount,
 }
 
 impl Position {
@@ -103,6 +107,8 @@ impl Position {
             reduce_only_ids: BTreeSet::new(),
             tp_order: None,
             sl_order: None,
+            risk_band: None,
+            risk_headroom: Amount::ZERO,
         }
     }
 
@@ -167,11 +173,15 @@ pub struct Account {
     /// Per-account fee overrides (VIP tiers).
     pub maker_fee: Option<Rate>,
     pub taker_fee: Option<Rate>,
+    /// State changed since the risk bands were last computed.
+    pub risk_dirty: bool,
+    /// Buffer of the cross positions held back from their bands for funding debits.
+    pub risk_headroom: Amount,
 }
 
 impl Account {
     pub fn new(id: AccountId) -> Self {
-        Self { id, balance: Amount::ZERO, positions: BTreeMap::new(), maker_fee: None, taker_fee: None }
+        Self { id, balance: Amount::ZERO, positions: BTreeMap::new(), maker_fee: None, taker_fee: None, risk_dirty: false, risk_headroom: Amount::ZERO }
     }
 }
 
