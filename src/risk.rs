@@ -5,10 +5,10 @@
 //! below maintenance margin, so only band breaches need an exact check.
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, BinaryHeap};
 
 use crate::account::{Account, Position};
-use crate::fixed::{Amount, Price, SCALE};
+use crate::fixed::{Amount, Price, Qty, SCALE};
 use crate::hash::FastMap;
 use crate::market::{Market, SymbolSpec};
 use crate::types::{AccountId, MarginMode, SymbolId};
@@ -174,38 +174,98 @@ fn side_index(sign: i64) -> usize {
     if sign > 0 { 0 } else { 1 }
 }
 
-/// ADL ranking of one symbol, valid while its mark is fixed (one liquidation pass).
+/// Heap entry. Max-heap order: highest score first, then lowest account id
+/// (the `Reverse`), which is the ADL priority order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AdlEntry {
+    score: i128,
+    account: Reverse<AccountId>,
+    version: u64,
+}
+
+/// ADL ranking of one symbol, valid while its mark is fixed (one liquidation
+/// pass).
+///
+/// Built in O(n) with a binary-heap `heapify` instead of a full sort, since an
+/// ADL usually needs only the first few counterparties. Updates push a new
+/// entry with a fresh version; entries whose version is no longer current are
+/// skipped when they reach the top (lazy deletion).
 #[derive(Default)]
 pub struct AdlRanking {
-    /// `[longs, shorts]`, ordered by score descending, then account ascending.
-    ranked: [BTreeSet<(Reverse<i128>, AccountId)>; 2],
-    entries: FastMap<AccountId, (usize, i128)>,
+    /// `[longs, shorts]`.
+    heaps: [BinaryHeap<AdlEntry>; 2],
+    /// Live entry per account: (side index, version).
+    current: FastMap<AccountId, (usize, u64)>,
+    next_version: u64,
 }
 
 impl AdlRanking {
     pub fn build<'a>(positions: impl Iterator<Item = (AccountId, &'a Position)>, mark: Price) -> Self {
         let mut r = Self::default();
-        for (a, p) in positions {
-            r.update(a, p, mark);
+        let mut sides: [Vec<AdlEntry>; 2] = [Vec::new(), Vec::new()];
+        for (account, pos) in positions {
+            if pos.size.is_zero() {
+                continue;
+            }
+            let side = side_index(pos.size.signum());
+            let version = r.next_version;
+            r.next_version += 1;
+            sides[side].push(AdlEntry { score: adl_score(pos, mark), account: Reverse(account), version });
+            r.current.insert(account, (side, version));
         }
+        let [longs, shorts] = sides;
+        r.heaps = [BinaryHeap::from(longs), BinaryHeap::from(shorts)];
         r
     }
 
     /// Re-ranks an account after its position changed.
     pub fn update(&mut self, account: AccountId, pos: &Position, mark: Price) {
-        if let Some((side, score)) = self.entries.remove(&account) {
-            self.ranked[side].remove(&(Reverse(score), account));
+        if pos.size.is_zero() {
+            self.current.remove(&account);
+            return;
         }
-        if !pos.size.is_zero() {
-            let side = side_index(pos.size.signum());
-            let score = adl_score(pos, mark);
-            self.ranked[side].insert((Reverse(score), account));
-            self.entries.insert(account, (side, score));
-        }
+        let side = side_index(pos.size.signum());
+        let version = self.next_version;
+        self.next_version += 1;
+        self.heaps[side].push(AdlEntry { score: adl_score(pos, mark), account: Reverse(account), version });
+        self.current.insert(account, (side, version));
     }
 
-    /// Accounts holding a position of sign `sign`, best ADL candidates first.
-    pub fn iter(&self, sign: i64) -> impl Iterator<Item = AccountId> + '_ {
-        self.ranked[side_index(sign)].iter().map(|&(_, a)| a)
+    /// Removes from the ranking, in priority order, the accounts holding a
+    /// position of sign `sign` (other than `exclude`) until their sizes cover
+    /// `qty`, and appends `(account, size)` to `out`.
+    ///
+    /// The caller must fill every returned account: the fill's `update`
+    /// re-inserts whatever position is left.
+    pub fn take_prefix(
+        &mut self,
+        sign: i64,
+        exclude: AccountId,
+        qty: Qty,
+        size_of: impl Fn(AccountId) -> Qty,
+        out: &mut Vec<(AccountId, Qty)>,
+    ) {
+        let side = side_index(sign);
+        let heap = &mut self.heaps[side];
+        let mut covered = Qty::ZERO;
+        let mut excluded = None;
+        while covered < qty {
+            let Some(e) = heap.pop() else { break };
+            let account = e.account.0;
+            if self.current.get(&account) != Some(&(side, e.version)) {
+                continue; // stale
+            }
+            if account == exclude {
+                excluded = Some(e);
+                continue;
+            }
+            self.current.remove(&account);
+            let size = size_of(account);
+            covered += size;
+            out.push((account, size));
+        }
+        if let Some(e) = excluded {
+            heap.push(e);
+        }
     }
 }

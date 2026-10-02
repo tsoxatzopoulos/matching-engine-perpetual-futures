@@ -84,7 +84,14 @@ impl Recorder {
 }
 
 fn run(commands: usize) -> Recorder {
+    run_with(commands, RearmPolicy::OnMark, 0)
+}
+
+/// `idle_rearm > 0` calls `rearm_pending(idle_rearm)` between commands, like
+/// the threaded runtime does when it has nothing to do.
+fn run_with(commands: usize, policy: RearmPolicy, idle_rearm: usize) -> Recorder {
     let mut engine = Engine::new();
+    engine.set_rearm_policy(policy);
     let mut workload = GoldenWorkload::new(SEED, ACCOUNTS);
     let mut rec = Recorder::new();
     for cmd in workload.setup() {
@@ -94,6 +101,9 @@ fn run(commands: usize) -> Recorder {
     for i in 0..commands {
         let cmd = workload.next(&engine);
         rec.record(engine.process(cmd));
+        if idle_rearm > 0 && i % 3 == 0 {
+            engine.rearm_pending(idle_rearm);
+        }
         if (i + 1) % CHUNK == 0 {
             rec.close_chunk(format!("chunk {:>3}", i / CHUNK));
         }
@@ -145,4 +155,20 @@ fn same_process_runs_agree() {
     let a = run(30_000);
     let b = run(30_000);
     assert_eq!(a.lines, b.lines);
+}
+
+/// Re-arm policies only move work around: the event stream must not change.
+#[test]
+fn rearm_policies_do_not_change_events() {
+    const PREFIX: usize = 60_000;
+    let reference = run(PREFIX);
+    let variants = [
+        ("per-command", RearmPolicy::PerCommand, 0),
+        ("threshold", RearmPolicy::Threshold(50), 0),
+        ("idle", RearmPolicy::OnMark, 7),
+    ];
+    for (name, policy, idle) in variants {
+        let rec = run_with(PREFIX, policy, idle);
+        assert_eq!(rec.lines, reference.lines, "policy {name} changed the event stream");
+    }
 }

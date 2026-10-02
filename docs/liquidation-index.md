@@ -39,8 +39,16 @@ whenever:
   change, leverage top-up, funding, clearance fee, or deficit coverage;
 - the account was a candidate and survived the exact check.
 
-Dirty accounts are re-armed at the end of each liquidation pass. Until then
-they are added as candidates to any pass of a symbol they hold.
+Until it is re-armed, a dirty account is a candidate in any pass of a symbol
+it holds. *When* re-arming happens is a `RearmPolicy`:
+- `OnMark` (default): at the end of the next liquidation pass.
+- `PerCommand`: at the end of every command.
+- `Threshold(n)`: at the end of a command once n accounts are dirty.
+
+The threaded runtime additionally re-arms in small batches while idle
+(`Engine::rearm_pending`). This only moves work around: the bands are valid
+whenever they exist, and stale accounts are always checked exactly. The golden
+test checks that every policy produces the same event stream.
 
 ## Buffer
 
@@ -62,7 +70,9 @@ positions under 25k USDT that gives μ = 0.4% instead of the 50% of the 1x tier.
 
 **The MM change.** As a function of notional, `MM(n) = max(n·mmr(n) − cum(n), 0)`.
 The maintenance amounts `cum` are built (`SymbolSpec::with_risk_tiers`) so that
-`n·mmr − cum` is **continuous** at the tier boundaries. On an interval, a continuous piecewise-linear function whose slopes there are
+`n·mmr − cum` is **continuous** at the tier boundaries. `risk_tiers` is a
+public field, so `add_market` re-checks continuity (`SymbolSpec::validate`)
+and rejects a spec that breaks it. Otherwise the proof would fail silently. On an interval, a continuous piecewise-linear function whose slopes there are
 all ≤ μ is μ-Lipschitz, and taking `max(·, 0)` keeps it μ-Lipschitz. Therefore:
 
     |ΔMM| ≤ μ·|Δn| = μ·|q|·|Δm|
@@ -157,10 +167,14 @@ skipping those holders changes no event.
 
 The ranking key is `(score desc, AccountId asc)`, where the score depends only
 on `(entry, size, leverage, mark)`. During a pass the marks are fixed, so the
-ranking of a symbol is built once, on the first ADL of the pass, as an ordered
-set. `apply_fill` updates the entry of any account whose position in that
-symbol changes. Each ADL walks the set from the top and visits the same
-prefix the old full sort produced. The cache is dropped at the end of the pass.
+ranking of a symbol is built once, on the first ADL of the pass, as a binary
+max-heap per side. `BinaryHeap::from` builds it in O(n), with no full sort.
+
+Each ADL pops entries from the top until their sizes cover the quantity. That
+is the same prefix the old full sort produced. When `apply_fill` changes a
+position during the pass, a new entry with a fresh version is pushed; entries
+whose version is no longer current are skipped when they reach the top (lazy
+deletion). The ranking is dropped at the end of the pass.
 
 ## Oracle
 

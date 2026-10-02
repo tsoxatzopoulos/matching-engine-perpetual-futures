@@ -19,7 +19,7 @@ fn main() {
 
     let mut e = Engine::new();
     let spec = SymbolSpec::new("BTCUSDT", Price::parse("0.1"), Qty::parse("0.001"));
-    let sym = e.add_market(spec, Price::from_int(60_000));
+    let sym = e.add_market(spec, Price::from_int(60_000)).unwrap();
     for acct in 1..=ACCOUNTS {
         e.deposit(acct, Amount::from_int(100_000_000)).unwrap();
     }

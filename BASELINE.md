@@ -214,3 +214,55 @@ In the baseline that cost was hidden in the first measured MarkPrice.
 - **Liquidating MarkPrice with 10 symbols** still costs ~30–45 ms. The
   remaining cost is building the ADL ranking once per symbol per pass, which is
   O(holders · log holders).
+
+---
+
+# Follow-up after review
+
+## Spec validation
+
+`add_market` now calls `SymbolSpec::validate`, which checks ascending tier
+limits, sane rates and maintenance-margin continuity at every tier boundary.
+The liquidation proof depends on that continuity, and `risk_tiers` is a public
+field. A spec that breaks it is rejected with `InvalidSpec`.
+
+## ADL ranking: ordered set → lazy binary heap
+
+Total time spent in ADL during the `perp_bench` run (temporary instrumentation,
+since removed):
+
+| Config | Before | After | Ranking builds |
+|---|---:|---:|---:|
+| 50k × 10 | 166 ms | 108 ms | 10 |
+| 50k × 1 | 342 ms | 188 ms | 36 |
+| 10k × 10 | 31 ms | 18 ms | 13 |
+
+What remains (~5 ms per build at 50k holders) is looking up every position
+and computing its score, not sorting. In the same runs, re-arming bands cost
+more than ADL at 10 symbols (567 ms total at 50k × 10, of which 143 ms is the
+one-off warm-up).
+
+## Re-arm policy
+
+`perp_bench --rearm=…`, 100k orders, 50k accounts × 10 symbols:
+
+| Policy | Order mean | Order p99 / p99.9 | Order max | First mark after mass trading | Quiet MarkPrice p50 | Liquidating MarkPrice max |
+|---|---:|---:|---:|---:|---:|---:|
+| `OnMark` (default) | 0.80 µs | 3.5 / 6.5 µs | 109 µs | 143 ms | 1.24 ms | 35.7 ms |
+| `PerCommand` | 3.75 µs | 31.9 / 45.0 µs | 158 µs | 0 | ~0 | 40.5 ms |
+| `Threshold(1000)` | 0.79 µs | 3.5 / 6.5 µs | 169 µs | 3.0 ms | 1.27 ms | 39.0 ms |
+| `Threshold(256)` | 0.83 µs | 3.5 / 6.9 µs | 1,672 µs | 0.3 ms | 1.33 ms | 39.4 ms |
+
+- Re-arming one account with positions in 10 symbols costs about 6.5 µs,
+  mostly 40 ordered-set operations.
+- `PerCommand` removes the mark-time cost, but makes every trading order pay:
+  mean ×4.7, p99 ×9.
+- `Threshold(n)` keeps orders cheap and bounds what a mark inherits. The
+  spike moves to the one order that crosses the threshold, about n × 6.5 µs.
+- Idle-time re-arming in the threaded runtime spreads the work without
+  charging any order, but a burst leaves no idle time. Not measured:
+  `perp_bench` drives the engine directly, without the runtime.
+
+## Wait strategy
+
+Engine thread idle for 2 s: `Spin` used 1.98 s of CPU, `Backoff` 0.10 s.

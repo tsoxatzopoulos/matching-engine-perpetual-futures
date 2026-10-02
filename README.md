@@ -106,7 +106,7 @@ fn main() {
     let btc = engine.add_market(
         SymbolSpec::new("BTCUSDT", Price::parse("0.1"), Qty::parse("0.001")),
         Price::parse("60000"),
-    );
+    ).unwrap();
 
     engine.deposit(1, Amount::parse("10000")).unwrap();
     engine.deposit(2, Amount::parse("10000")).unwrap();
@@ -167,6 +167,18 @@ while let Some(out) = handle.recv() {
 }
 let engine = handle.shutdown(); // finishes queued commands and returns the final state
 ```
+
+Two knobs trade latency for other costs:
+
+- **`WaitStrategy`** (`EngineHandle::spawn_with`): `Spin` busy-waits for the
+  lowest latency and keeps a core at 100% even when idle. `WaitStrategy::backoff()`
+  spins briefly, then yields, then sleeps 50 µs, which is better for
+  simulations on a laptop. Idle CPU measured at 100% vs ~5%.
+- **`RearmPolicy`** (`Engine::set_rearm_policy`): when the liquidation index
+  recomputes the risk bands of accounts that traded. `OnMark` (default) keeps
+  orders cheapest; `PerCommand` and `Threshold(n)` move that work from the next
+  `MarkPrice` to the orders. See `BASELINE.md` for measurements. The event
+  stream is identical under every policy.
 
 ### Commands
 

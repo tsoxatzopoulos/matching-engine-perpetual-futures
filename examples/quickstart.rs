@@ -3,7 +3,7 @@ use futures_engine::*;
 fn main() {
     let mut e = Engine::new();
     let btc = e.add_market(SymbolSpec::new("BTCUSDT", Price::parse("0.1"), Qty::parse("0.001")),
-                           Price::parse("60000"));
+                           Price::parse("60000")).unwrap();
     e.deposit(1, Amount::parse("10000")).unwrap();
     e.deposit(2, Amount::parse("10000")).unwrap();
     e.set_leverage(1, btc, 20).unwrap();

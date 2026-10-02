@@ -23,7 +23,7 @@ fn spec() -> SymbolSpec {
 
 fn setup_with(spec: SymbolSpec) -> Engine {
     let mut e = Engine::new();
-    e.add_market(spec, p("100"));
+    e.add_market(spec, p("100")).unwrap();
     for acct in 1..=6 {
         e.deposit(acct, a("100000")).unwrap();
     }
@@ -446,7 +446,7 @@ fn closing_orders_need_no_margin() {
 fn risk_limit_caps_leverage() {
     let mut e = Engine::new();
     let spec = spec().with_risk_tiers(&[(a("1000"), 50, r("0.01")), (a("10000"), 10, r("0.05"))]);
-    e.add_market(spec, p("100"));
+    e.add_market(spec, p("100")).unwrap();
     e.deposit(1, a("100000")).unwrap();
     e.set_leverage(1, S, 50).unwrap();
     // 2000 notional falls in tier 2: max 10x
@@ -589,6 +589,28 @@ fn liquidation_cancels_orders_first() {
     assert_eq!(done_reason(&e.take_events(), tp), Some(DoneReason::Liquidation));
 }
 
+#[test]
+fn hand_built_risk_tiers_must_be_continuous() {
+    let mut e = Engine::new();
+    let good = spec().with_risk_tiers(&[(a("1000"), 50, r("0.01")), (a("10000"), 10, r("0.05"))]);
+    assert_eq!(good.risk_tiers[1].maint_amount, a("40")); // 1000 * (0.05 - 0.01)
+    e.add_market(good.clone(), p("100")).unwrap();
+
+    // Same tiers, but the maintenance amount left at zero: MM would jump at 1000.
+    let mut broken = good.clone();
+    broken.risk_tiers[1].maint_amount = Amount::ZERO;
+    assert_eq!(e.add_market(broken, p("100")), Err(RejectReason::InvalidSpec));
+
+    let mut unordered = good.clone();
+    unordered.risk_tiers.swap(0, 1);
+    assert_eq!(e.add_market(unordered, p("100")), Err(RejectReason::InvalidSpec));
+
+    let mut no_tiers = good;
+    no_tiers.risk_tiers.clear();
+    assert_eq!(e.add_market(no_tiers, p("100")), Err(RejectReason::InvalidSpec));
+    assert_eq!(e.markets().len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Runtime
 // ---------------------------------------------------------------------------
@@ -631,4 +653,22 @@ fn engine_thread_shutdown_drains_queued_commands() {
     }
     let engine = h.shutdown();
     assert_eq!(engine.account(200).unwrap().balance, a("1000"));
+}
+
+#[test]
+fn engine_thread_with_backoff() {
+    let mut h = EngineHandle::spawn_with(Engine::new(), 4, 4, WaitStrategy::backoff());
+    h.send(Command::AddMarket { spec: spec(), price: p("100") }).unwrap();
+    // Let the engine go idle long enough to reach the sleeping stage.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    for account in 1..=50 {
+        h.send(Command::Deposit { account, amount: a("10") }).unwrap();
+    }
+    let mut done = 0;
+    while done < 51 {
+        if let Output::Done { .. } = h.recv().unwrap() {
+            done += 1;
+        }
+    }
+    assert_eq!(h.shutdown().account(50).unwrap().balance, a("10"));
 }

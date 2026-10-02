@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use crate::book::OrderBook;
 use crate::conditional::ConditionalBook;
+use crate::events::RejectReason;
 use crate::fixed::{Amount, Price, Qty, Rate, Round};
 use crate::risk::RiskBands;
 use crate::types::{AccountId, SymbolId, TriggerBy};
@@ -128,6 +129,44 @@ impl SymbolSpec {
     pub fn with_liquidation_fee(mut self, fee: Rate) -> Self {
         self.liquidation_fee = fee;
         self
+    }
+
+    /// Checks the spec before a market is listed.
+    ///
+    /// The liquidation index (`risk`) relies on maintenance margin being a
+    /// continuous function of notional. `with_risk_tiers` builds the tiers that
+    /// way, but `risk_tiers` is a public field, so tiers filled in by hand are
+    /// checked here: ascending notional limits, sane rates, and maintenance
+    /// amounts that make `n·mmr − maint_amount` meet at every tier boundary.
+    pub fn validate(&self) -> Result<(), RejectReason> {
+        let bad = Err(RejectReason::InvalidSpec);
+        if !self.tick_size.is_pos() || !self.lot_size.is_pos() || self.min_qty > self.max_qty {
+            return bad;
+        }
+        if self.risk_tiers.is_empty() || self.default_leverage == 0 || self.default_leverage > self.max_leverage() {
+            return bad;
+        }
+        for (i, t) in self.risk_tiers.iter().enumerate() {
+            if !t.max_notional.is_pos() || t.max_leverage == 0 || t.mmr.is_neg() || t.mmr >= Rate::ONE {
+                return bad;
+            }
+            if t.maint_amount.is_neg() {
+                return bad;
+            }
+            if let Some(prev) = i.checked_sub(1).map(|j| &self.risk_tiers[j]) {
+                if t.max_notional <= prev.max_notional {
+                    return bad;
+                }
+                // Continuity at n = prev.max_notional, same rounding as
+                // `with_risk_tiers`, with one raw unit of tolerance.
+                let expected =
+                    prev.maint_amount + prev.max_notional.mul_rate(t.mmr - prev.mmr, Round::Down);
+                if (t.maint_amount - expected).abs() > Amount(1) {
+                    return bad;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Tier for a position notional, `None` above the risk limit.

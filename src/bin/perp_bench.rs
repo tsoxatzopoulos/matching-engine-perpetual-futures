@@ -4,7 +4,7 @@
 //! Measured separately: latency per order command (place / cancel), per
 //! `MarkPrice` (trigger scan + liquidation check) and per `Funding`.
 //!
-//! cargo run --release --bin perp_bench [orders_per_config] [accounts:symbols ...]
+//! cargo run --release --bin perp_bench [orders_per_config] [accounts:symbols ...] [--rearm=mark|command|N]
 
 use std::time::Instant;
 
@@ -56,9 +56,10 @@ fn accepted_id(events: &[Event]) -> Option<OrderId> {
     })
 }
 
-fn run(cfg: &Config, n_orders: usize) -> Report {
+fn run(cfg: &Config, n_orders: usize, policy: RearmPolicy) -> Report {
     let mut rng = Rng::new(0xBE7C_4000 + cfg.accounts * 31 + cfg.symbols as u64);
     let mut e = Engine::new();
+    e.set_rearm_policy(policy);
     let tick = Price::parse("0.01");
     let lot = Qty::parse("0.001");
     let mut marks: Vec<Price> = Vec::new();
@@ -221,7 +222,17 @@ fn ms(ns: f64) -> String {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let all: Vec<String> = std::env::args().skip(1).collect();
+    let policy = all
+        .iter()
+        .find_map(|a| a.strip_prefix("--rearm="))
+        .map(|p| match p {
+            "mark" => RearmPolicy::OnMark,
+            "command" => RearmPolicy::PerCommand,
+            n => RearmPolicy::Threshold(n.parse().expect("--rearm=mark|command|N")),
+        })
+        .unwrap_or_default();
+    let mut args = all.into_iter().filter(|a| !a.starts_with("--"));
     let n_orders: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(100_000);
     let mut configs: Vec<Config> = args
         .filter_map(|a| {
@@ -237,13 +248,13 @@ fn main() {
         }
     }
 
-    println!("orders per config: {n_orders}, MarkPrice every {MARK_EVERY} orders, Funding every {FUNDING_EVERY_MARKS} MarkPrice\n");
+    println!("orders per config: {n_orders}, MarkPrice every {MARK_EVERY} orders, Funding every {FUNDING_EVERY_MARKS} MarkPrice, rearm policy {policy:?}\n");
     println!("### Order commands (place / cancel), µs\n");
     println!("| accounts | symbols | positions | setup s | warm-up ms | p50 | p99 | p99.9 | max | mean |");
     println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     let mut rows = Vec::new();
     for cfg in &configs {
-        let mut r = run(cfg, n_orders);
+        let mut r = run(cfg, n_orders, policy);
         r.orders.sort_unstable();
         r.marks.sort_unstable();
         r.marks_quiet.sort_unstable();

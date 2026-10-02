@@ -25,10 +25,10 @@ pub mod spsc;
 pub mod types;
 
 pub use account::{Account, MarginSummary, OpenOrders, Position};
-pub use engine::{Command, Depth, Engine};
+pub use engine::{Command, Depth, Engine, RearmPolicy};
 pub use events::{BalanceReason, DoneReason, Event, RejectReason};
 pub use fixed::{Amount, Price, Qty, Rate, Round};
 pub use market::{Market, RiskTier, SymbolSpec};
 pub use order::{NewOrder, Order, TpSl, TrailingOffset, TrailingSpec};
-pub use runtime::{EngineHandle, EngineStopped, Output};
+pub use runtime::{EngineHandle, EngineStopped, Output, WaitStrategy};
 pub use types::*;

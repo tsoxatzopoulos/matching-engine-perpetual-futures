@@ -47,6 +47,25 @@ pub enum Command {
     Funding { symbol: SymbolId, rate: Rate },
 }
 
+/// When accounts whose state changed get their risk bands recomputed.
+///
+/// This only moves work around: the event stream is identical under every
+/// policy (checked by the golden test). Dirty accounts not yet re-armed are
+/// always checked exactly at the next mark of a symbol they hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RearmPolicy {
+    /// All together at the next liquidation pass (`MarkPrice` / `Funding`).
+    /// Cheapest per order; a burst of trades makes the next mark pay for all.
+    #[default]
+    OnMark,
+    /// At the end of every command. Spreads the cost over the trades that
+    /// cause it; every filled order pays for its accounts.
+    PerCommand,
+    /// At the end of a command once at least this many accounts are dirty.
+    /// Bounds the work left for the next mark.
+    Threshold(usize),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Depth {
     pub bids: Vec<(Price, Qty)>,
@@ -89,6 +108,7 @@ pub struct Engine {
     /// Per-symbol ADL ranking, built lazily during a liquidation pass.
     adl_rankings: Vec<Option<AdlRanking>>,
     armed_buf: Armed,
+    rearm_policy: RearmPolicy,
 }
 
 impl Default for Engine {
@@ -136,6 +156,7 @@ impl Engine {
             liq_pass: None,
             adl_rankings: Vec::new(),
             armed_buf: Armed::default(),
+            rearm_policy: RearmPolicy::default(),
         }
     }
 
@@ -238,10 +259,7 @@ impl Engine {
 
     fn dispatch(&mut self, cmd: Command) {
         let _ = match cmd {
-            Command::AddMarket { spec, price } => {
-                self.add_market(spec, price);
-                Ok(())
-            }
+            Command::AddMarket { spec, price } => self.add_market(spec, price).map(|_| ()),
             Command::Deposit { account, amount } => self.deposit(account, amount),
             Command::Withdraw { account, amount } => self.withdraw(account, amount),
             Command::FundInsurance { amount } => self.fund_insurance(amount),
@@ -270,17 +288,63 @@ impl Engine {
         if let Err(reason) = r {
             self.events.push(Event::CommandRejected { reason });
         }
-        self.settle();
+        self.end_command();
         r
     }
 
-    pub fn add_market(&mut self, mut spec: SymbolSpec, price: Price) -> SymbolId {
-        let id = self.markets.len() as SymbolId;
-        spec.id = id;
-        self.markets.push(Market::new(spec, price));
-        self.adl_rankings.push(None);
-        self.events.push(Event::MarketAdded { symbol: id });
-        id
+    /// Settles cascades and applies the re-arm policy.
+    fn end_command(&mut self) {
+        self.settle();
+        let rearm = match self.rearm_policy {
+            RearmPolicy::OnMark => false,
+            RearmPolicy::PerCommand => !self.risk_dirty.is_empty(),
+            RearmPolicy::Threshold(n) => self.risk_dirty.len() >= n.max(1),
+        };
+        if rearm {
+            self.rearm_dirty();
+        }
+    }
+
+    pub fn set_rearm_policy(&mut self, policy: RearmPolicy) {
+        self.rearm_policy = policy;
+    }
+
+    pub fn rearm_policy(&self) -> RearmPolicy {
+        self.rearm_policy
+    }
+
+    /// Re-arms up to `max` dirty accounts and returns how many it did. Meant
+    /// for idle time (the threaded runtime calls it when no command is
+    /// waiting), so the next mark finds less work.
+    pub fn rearm_pending(&mut self, max: usize) -> usize {
+        let n = self.risk_dirty.len().min(max);
+        if n > 0 {
+            let start = self.risk_dirty.len() - n;
+            let batch: Vec<AccountId> = self.risk_dirty.drain(start..).collect();
+            self.rearm_accounts(&batch);
+        }
+        n
+    }
+
+    /// Number of accounts whose risk bands are stale.
+    pub fn pending_rearms(&self) -> usize {
+        self.risk_dirty.len()
+    }
+
+    /// Lists a new market. Rejects specs that fail `SymbolSpec::validate`.
+    pub fn add_market(&mut self, mut spec: SymbolSpec, price: Price) -> Result<SymbolId, RejectReason> {
+        let r = spec.validate().and_then(|()| {
+            if !price.is_pos() {
+                return Err(RejectReason::InvalidPrice);
+            }
+            let id = self.markets.len() as SymbolId;
+            spec.id = id;
+            self.markets.push(Market::new(spec, price));
+            self.adl_rankings.push(None);
+            self.events.push(Event::MarketAdded { symbol: id });
+            Ok(id)
+        });
+        self.finish(r)
     }
 
     pub fn deposit(&mut self, account: AccountId, amount: Amount) -> Result<(), RejectReason> {
@@ -360,7 +424,7 @@ impl Engine {
                 reason,
             });
         }
-        self.settle();
+        self.end_command();
         r
     }
 
@@ -1619,8 +1683,14 @@ impl Engine {
     /// Recomputes the risk bands of every dirty account at the current marks.
     fn rearm_dirty(&mut self) {
         let mut dirty = std::mem::take(&mut self.risk_dirty);
+        self.rearm_accounts(&dirty);
+        dirty.clear();
+        self.risk_dirty = dirty;
+    }
+
+    fn rearm_accounts(&mut self, accounts: &[AccountId]) {
         let mut armed = std::mem::take(&mut self.armed_buf);
-        for &account in &dirty {
+        for &account in accounts {
             let Some(acct) = self.accounts.get_mut(&account) else { continue };
             acct.risk_dirty = false;
             for (&sym, pos) in acct.positions.iter_mut() {
@@ -1637,8 +1707,6 @@ impl Engine {
                 self.markets[sym as usize].risk.insert(account, band);
             }
         }
-        dirty.clear();
-        self.risk_dirty = dirty;
         self.armed_buf = armed;
     }
 
@@ -1804,17 +1872,11 @@ impl Engine {
         // to close, which means their size has the sign of `side`. Take the
         // ranked prefix that covers `qty`, with sizes as of now.
         let mut ranked: Vec<(AccountId, Qty)> = Vec::new();
-        let mut covered = Qty::ZERO;
-        for a in self.adl_rankings[si].as_ref().expect("ranking").iter(side.sign()) {
-            if covered >= qty {
-                break;
-            }
-            if a == liquidated {
-                continue;
-            }
-            let size = self.accounts[&a].positions[&symbol].size.abs();
-            covered += size;
-            ranked.push((a, size));
+        {
+            let accounts = &self.accounts;
+            let ranking = self.adl_rankings[si].as_mut().expect("ranking");
+            let size_of = |a: AccountId| accounts[&a].positions[&symbol].size.abs();
+            ranking.take_prefix(side.sign(), liquidated, qty, size_of, &mut ranked);
         }
 
         let mut remaining = qty;
