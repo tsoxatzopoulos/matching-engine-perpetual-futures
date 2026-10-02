@@ -9,6 +9,8 @@ pub enum RejectReason {
     UnknownAccount,
     UnknownOrder,
     InvalidAmount,
+    /// Contract spec failed validation (see `SymbolSpec::validate`).
+    InvalidSpec,
     InvalidQty,
     LotSize,
     InvalidPrice,

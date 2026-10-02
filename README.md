@@ -106,7 +106,7 @@ fn main() {
     let btc = engine.add_market(
         SymbolSpec::new("BTCUSDT", Price::parse("0.1"), Qty::parse("0.001")),
         Price::parse("60000"),
-    );
+    ).unwrap();
 
     engine.deposit(1, Amount::parse("10000")).unwrap();
     engine.deposit(2, Amount::parse("10000")).unwrap();
@@ -148,14 +148,37 @@ NewOrder::trailing_stop(acct, sym, Side::Sell, TrailingOffset::Rate(Rate::parse(
 
 ### Running on its own thread
 
+The engine thread sits behind two lock-free SPSC ring buffers (`src/spsc.rs`):
+one for commands and one for events. Each event comes out tagged with the
+sequence number of its command, followed by `Output::Done`, so nothing is
+allocated per command. The engine thread busy-spins while idle.
+
 ```rust
-let handle = EngineHandle::spawn(Engine::new(), 65_536);
+let mut handle = EngineHandle::spawn(Engine::new(), 1 << 12, 1 << 16);
 handle.send(Command::AddMarket { spec, price }).unwrap();
 handle.send(Command::PlaceOrder(order)).unwrap();
 
-let (seq, events) = handle.events().recv().unwrap();
-let engine = handle.shutdown(); // drains the queue and returns the final state
+while let Some(out) = handle.recv() {
+    match out {
+        Output::Event { seq, event } => println!("#{seq}: {event:?}"),
+        Output::Done { seq } if seq == 2 => break,
+        Output::Done { .. } => {}
+    }
+}
+let engine = handle.shutdown(); // finishes queued commands and returns the final state
 ```
+
+Two knobs trade latency for other costs:
+
+- **`WaitStrategy`** (`EngineHandle::spawn_with`): `Spin` busy-waits for the
+  lowest latency and keeps a core at 100% even when idle. `WaitStrategy::backoff()`
+  spins briefly, then yields, then sleeps 50 µs, which is better for
+  simulations on a laptop. Idle CPU measured at 100% vs ~5%.
+- **`RearmPolicy`** (`Engine::set_rearm_policy`): when the liquidation index
+  recomputes the risk bands of accounts that traded. `OnMark` (default) keeps
+  orders cheapest; `PerCommand` and `Threshold(n)` move that work from the next
+  `MarkPrice` to the orders. See `BASELINE.md` for measurements. The event
+  stream is identical under every policy.
 
 ### Commands
 
@@ -247,7 +270,6 @@ On a single core of a laptop it reaches about **1.6M commands/s (~600 ns/command
 - [ ] Partial liquidation by risk tier
 - [ ] GTD orders (time-aware engine)
 - [ ] Mark-price and funding-rate calculation from index and premium
-- [ ] Lock-free SPSC ring buffer in place of the std channel
 
 ## Acknowledgements
 
@@ -264,3 +286,5 @@ These projects influenced the design:
 ## Disclaimer
 
 This is an educational project. It has not been audited and is not intended for production trading with real funds.
+
+

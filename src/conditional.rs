@@ -4,7 +4,9 @@
 //! source, so finding the orders a price move fires is a range scan. Trailing
 //! stops move their trigger with the price and are updated on every tick.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+
+use crate::hash::FastMap;
 
 use crate::fixed::Price;
 use crate::order::{trailing_stop_price, Order};
@@ -12,7 +14,7 @@ use crate::types::{OrderId, Side, TriggerBy, TriggerDir};
 
 #[derive(Default)]
 pub struct ConditionalBook {
-    orders: HashMap<OrderId, Order>,
+    orders: FastMap<OrderId, Order>,
     /// Fire when price >= trigger. Indexed by `TriggerBy`.
     rising: [BTreeSet<(Price, OrderId)>; 2],
     /// Fire when price <= trigger.
